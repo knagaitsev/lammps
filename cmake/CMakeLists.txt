@@ -234,11 +234,27 @@ option(BUILD_SHARED_LIBS "Build shared library" OFF)
 option(CMAKE_POSITION_INDEPENDENT_CODE "Create object compatible with shared libraries" ON)
 option(BUILD_TOOLS "Build and install LAMMPS tools (msi2lmp, binary2txt, chain)" OFF)
 option(BUILD_LAMMPS_GUI "Build and install the LAMMPS GUI" OFF)
+set(LAMMPS_LJLC_DEOPT_IMPL "" CACHE FILEPATH "Candidate source file with lj/long/coul/long/deopt eval and eval_outer implementations")
+option(LAMMPS_LJLC_DEOPT_ENABLE_EVAL "Route lj/long/coul/long/deopt compute() through the candidate eval() implementation" OFF)
+option(LAMMPS_LJLC_DEOPT_ENABLE_EVAL_OUTER "Route lj/long/coul/long/deopt compute_outer() through the candidate eval_outer() implementation" OFF)
 
 file(GLOB ALL_SOURCES CONFIGURE_DEPENDS ${LAMMPS_SOURCE_DIR}/[^.]*.cpp)
 file(GLOB MAIN_SOURCES CONFIGURE_DEPENDS ${LAMMPS_SOURCE_DIR}/main.cpp)
 list(REMOVE_ITEM ALL_SOURCES ${MAIN_SOURCES})
 add_library(lammps ${ALL_SOURCES})
+
+set(LAMMPS_LJLC_DEOPT_COMPILE_DEFINITIONS)
+if(LAMMPS_LJLC_DEOPT_IMPL)
+  list(APPEND LAMMPS_LJLC_DEOPT_COMPILE_DEFINITIONS LAMMPS_LJLC_DEOPT_IMPL="${LAMMPS_LJLC_DEOPT_IMPL}")
+endif()
+if(LAMMPS_LJLC_DEOPT_ENABLE_EVAL)
+  list(APPEND LAMMPS_LJLC_DEOPT_COMPILE_DEFINITIONS LAMMPS_LJLC_DEOPT_ENABLE_EVAL)
+endif()
+if(LAMMPS_LJLC_DEOPT_ENABLE_EVAL_OUTER)
+  list(APPEND LAMMPS_LJLC_DEOPT_COMPILE_DEFINITIONS LAMMPS_LJLC_DEOPT_ENABLE_EVAL_OUTER)
+endif()
+set_source_files_properties(${LAMMPS_SOURCE_DIR}/KSPACE/pair_lj_long_coul_long_deopt.cpp
+  PROPERTIES COMPILE_DEFINITIONS "${LAMMPS_LJLC_DEOPT_COMPILE_DEFINITIONS}")
 
 # add extra libraries for std::filesystem with older compilers
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.1)
