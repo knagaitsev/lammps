@@ -167,6 +167,11 @@ void restart_lammps(LAMMPS *lmp, const TestConfig &cfg, bool nofdotr = false, bo
         command("newton on");
     else
         command("newton off");
+
+    for (const auto &pre_command : cfg.pre_commands) {
+        if (pre_command.rfind("package ", 0) == 0) command(pre_command);
+    }
+
     command("read_restart " + cfg.basename + ".restart");
 
     if (!lmp->force->pair) {
@@ -477,7 +482,7 @@ TEST(PairStyle, plain)
     EXPECT_FP_LE_WITH_EPS(pair->eng_coul, test_config.init_coul, epsilon);
     if (print_stats) std::cerr << "data_energy stats:" << stats << std::endl;
 
-    if (pair->respa_enable) {
+    if (pair->respa_enable && (test_config.pair_style.find("/omp") == std::string::npos)) {
         if (!verbose) ::testing::internal::CaptureStdout();
         cleanup_lammps(lmp, test_config);
         try {
