@@ -64,3 +64,5 @@ src/Makefile.package.settings-e
 /test
 /dev
 .Rhistory
+
+data/
