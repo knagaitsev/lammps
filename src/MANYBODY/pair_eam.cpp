@@ -30,8 +30,248 @@
 
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 using namespace LAMMPS_NS;
+
+/* ----------------------------------------------------------------------
+   Functional-form helper library for the EAM core math.
+
+   The embedded-atom-model energy of atom i is
+       E_i = F_a( sum_{j!=i} rho_b(r_ij) )  +  (1/2) sum_{j!=i} phi_ab(r_ij)
+   (F = embedding function, rho = electron density, phi = pair potential).
+
+   The helpers below express PairEAM::compute() as a small number of pure
+   functions (rho, F, phi and their derivatives are cubic-Hermite spline
+   lookups) combined by generic, order-preserving map / filter / reduce
+   combinators.  The combinators build and fold their results in neighbor-list
+   order so the floating-point accumulation order is identical to the original
+   hand-written loops (required to stay within the differential-test epsilon).
+------------------------------------------------------------------------- */
+
+namespace {
+
+// --- generic, order-preserving combinators --------------------------------
+
+template <class T, class F>
+auto map(const std::vector<T> &xs, F f) -> std::vector<decltype(f(xs[0]))>
+{
+  std::vector<decltype(f(xs[0]))> out;
+  out.reserve(xs.size());
+  for (const T &x : xs) out.push_back(f(x));
+  return out;
+}
+
+template <class T, class Pred>
+std::vector<T> filter(const std::vector<T> &xs, Pred keep)
+{
+  std::vector<T> out;
+  for (const T &x : xs)
+    if (keep(x)) out.push_back(x);
+  return out;
+}
+
+// left fold: reduce(xs, init, f) = f(f(f(init, x0), x1), ...) in list order
+template <class T, class A, class F>
+A reduce(const std::vector<T> &xs, A init, F f)
+{
+  A acc = init;
+  for (const T &x : xs) acc = f(acc, x);
+  return acc;
+}
+
+// --- value types ----------------------------------------------------------
+
+struct Vec3 {
+  double x;
+  double y;
+  double z;
+};
+
+// a spline argument located in bin `index` at fractional offset `fraction`
+struct SplinePoint {
+  int index;
+  double fraction;
+};
+
+// spline terms needed to build the per-pair force and pair energy
+struct EAMPairSplineTerms {
+  double density_derivative_i;             // rho'_(i->j)(r)
+  double density_derivative_j;             // rho'_(j->i)(r)
+  double pair_potential_times_r;           // z2(r) = r * phi(r)
+  double pair_potential_times_r_derivative;// z2'(r)
+};
+
+// an in-cutoff neighbor j of some atom i, with the geometry it induces
+struct NeighborContext {
+  int j;
+  int jtype;
+  Vec3 rij;
+  double r;
+  SplinePoint radial;
+};
+
+// scalar force magnitude/r and the (scaled) pair energy for one pair
+struct PairForceEnergy {
+  double fpair;
+  double pair_energy;
+};
+
+// --- pure geometry --------------------------------------------------------
+
+Vec3 atom_position(double **x, int i)
+{
+  return {x[i][0], x[i][1], x[i][2]};
+}
+
+Vec3 displacement(const Vec3 &xi, const Vec3 &xj)
+{
+  return {xi.x - xj.x, xi.y - xj.y, xi.z - xj.z};
+}
+
+double dot(const Vec3 &a, const Vec3 &b)
+{
+  return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+int neighbor_atom(int packed_neighbor)
+{
+  return packed_neighbor & NEIGHMASK;
+}
+
+// --- pure spline evaluation -----------------------------------------------
+
+// cubic value: ((c3*p + c4)*p + c5)*p + c6
+double eam_spline_value(const double *coeff, double p)
+{
+  return ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
+}
+
+// analytic derivative (already divided by grid spacing): (c0*p + c1)*p + c2
+double eam_spline_derivative(const double *coeff, double p)
+{
+  return (coeff[0]*p + coeff[1])*p + coeff[2];
+}
+
+SplinePoint eam_radial_spline_point(double r, double rdr, int nr)
+{
+  double p = r*rdr + 1.0;
+  int m = static_cast<int>(p);
+  m = MIN(m,nr-1);
+  p -= m;
+  p = MIN(p,1.0);
+  return {m,p};
+}
+
+SplinePoint eam_density_spline_point(double density, double rdrho, int nrho)
+{
+  double p = density*rdrho + 1.0;
+  int m = static_cast<int>(p);
+  m = MAX(1,MIN(m,nrho-1));
+  p -= m;
+  p = MIN(p,1.0);
+  return {m,p};
+}
+
+// --- pure EAM physics (rho, F, F', phi) -----------------------------------
+
+// rho: electron density deposited by a `source_type` atom onto a `target_type`
+// atom at radial spline point `r`
+double eam_density_value(double ***rhor_spline, int **type2rhor, int source_type,
+                         int target_type, const SplinePoint &r)
+{
+  return eam_spline_value(rhor_spline[type2rhor[source_type][target_type]][r.index], r.fraction);
+}
+
+// F': derivative of the embedding energy at density point `density`
+double eam_embedding_derivative(double ***frho_spline, int *type2frho, int type,
+                                const SplinePoint &density)
+{
+  return eam_spline_derivative(frho_spline[type2frho[type]][density.index], density.fraction);
+}
+
+// F: embedding energy at density point `density`
+double eam_embedding_energy(double ***frho_spline, int *type2frho, int type,
+                            const SplinePoint &density)
+{
+  return eam_spline_value(frho_spline[type2frho[type]][density.index], density.fraction);
+}
+
+EAMPairSplineTerms eam_pair_spline_terms(double ***rhor_spline, double ***z2r_spline,
+                                         int **type2rhor, int **type2z2r, int itype, int jtype,
+                                         const SplinePoint &r)
+{
+  const double density_derivative_i =
+      eam_spline_derivative(rhor_spline[type2rhor[itype][jtype]][r.index], r.fraction);
+  const double density_derivative_j =
+      eam_spline_derivative(rhor_spline[type2rhor[jtype][itype]][r.index], r.fraction);
+  const double *z = z2r_spline[type2z2r[itype][jtype]][r.index];
+  const double pair_potential_times_r_derivative = eam_spline_derivative(z, r.fraction);
+  const double pair_potential_times_r = eam_spline_value(z, r.fraction);
+  return {density_derivative_i, density_derivative_j, pair_potential_times_r,
+          pair_potential_times_r_derivative};
+}
+
+// per-pair scalar force (fpair) and pair energy, i.e. the analytic gradient of
+// the EAM energy for one pair.  phi = z2/r, phi' = z2'/r - phi/r, and
+// psip = dE/dr = F'(rho_i) rho'_(j->i) + F'(rho_j) rho'_(i->j) + phi'.
+PairForceEnergy eam_pair_force_energy(const EAMPairSplineTerms &terms, double fp_i, double fp_j,
+                                      double r, double scale)
+{
+  const double recip = 1.0/r;
+  const double phi = terms.pair_potential_times_r*recip;
+  const double phip = terms.pair_potential_times_r_derivative*recip - phi*recip;
+  const double psip = fp_i*terms.density_derivative_j + fp_j*terms.density_derivative_i + phip;
+  return {-scale*psip*recip, scale*phi};
+}
+
+// --- neighbor selection: filter to within-cutoff, map to NeighborContext ---
+
+// filter(not_curr_atom / within cutoff) . map(distance) over atom i's half list
+std::vector<NeighborContext> in_cutoff_neighbors(int i, double **x, int *type, int *jlist,
+                                                 int jnum, double cutforcesq, double rdr, int nr)
+{
+  struct RawNeighbor {
+    int j;
+    int jtype;
+    Vec3 rij;
+    double rsq;
+  };
+
+  const Vec3 xi = atom_position(x,i);
+
+  std::vector<int> slots(jnum);
+  for (int jj = 0; jj < jnum; jj++) slots[jj] = jj;
+
+  const std::vector<RawNeighbor> raw = map(slots, [&](int jj) {
+    const int j = neighbor_atom(jlist[jj]);
+    const Vec3 rij = displacement(xi, atom_position(x,j));
+    return RawNeighbor{j, type[j], rij, dot(rij,rij)};
+  });
+
+  const std::vector<RawNeighbor> within =
+      filter(raw, [&](const RawNeighbor &nb) { return nb.rsq < cutforcesq; });
+
+  return map(within, [&](const RawNeighbor &nb) {
+    const double r = sqrt(nb.rsq);
+    return NeighborContext{nb.j, nb.jtype, nb.rij, r, eam_radial_spline_point(r, rdr, nr)};
+  });
+}
+
+void apply_pair_force(double **f, int i, int j, const Vec3 &rij, double fpair, int newton_pair,
+                      int nlocal)
+{
+  f[i][0] += rij.x*fpair;
+  f[i][1] += rij.y*fpair;
+  f[i][2] += rij.z*fpair;
+  if (newton_pair || j < nlocal) {
+    f[j][0] -= rij.x*fpair;
+    f[j][1] -= rij.y*fpair;
+    f[j][2] -= rij.z*fpair;
+  }
+}
+
+}    // namespace
 
 /* ---------------------------------------------------------------------- */
 
@@ -140,13 +380,6 @@ PairEAM::~PairEAM()
 
 void PairEAM::compute(int eflag, int vflag)
 {
-  int i,j,ii,jj,m,inum,jnum,itype,jtype;
-  double xtmp,ytmp,ztmp,delx,dely,delz,evdwl,fpair;
-  double rsq,r,p,rhoip,rhojp,z2,z2p,recip,phip,psip,phi;
-  double *coeff;
-  int *ilist,*jlist,*numneigh,**firstneigh;
-
-  evdwl = 0.0;
   ev_init(eflag,vflag);
 
   int beyond_rhomax = 0;
@@ -167,56 +400,44 @@ void PairEAM::compute(int eflag, int vflag)
   double **x = atom->x;
   double **f = atom->f;
   int *type = atom->type;
-  int nlocal = atom->nlocal;
-  int nall = nlocal + atom->nghost;
-  int newton_pair = force->newton_pair;
+  const int nlocal = atom->nlocal;
+  const int nall = nlocal + atom->nghost;
+  const int newton_pair = force->newton_pair;
 
-  inum = list->inum;
-  ilist = list->ilist;
-  numneigh = list->numneigh;
-  firstneigh = list->firstneigh;
+  const int inum = list->inum;
+  int *ilist = list->ilist;
+  int *numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
 
   // zero out density
 
   if (newton_pair) {
-    for (i = 0; i < nall; i++) rho[i] = 0.0;
-  } else for (i = 0; i < nlocal; i++) rho[i] = 0.0;
+    for (int i = 0; i < nall; i++) rho[i] = 0.0;
+  } else for (int i = 0; i < nlocal; i++) rho[i] = 0.0;
 
-  // rho = density at each atom
-  // loop over neighbors of my atoms
+  // -------------------------------------------------------------------------
+  // Stage 1 - density:  rho_i = sum_{j != i} rho_beta(r_ij)
+  //
+  // With a half neighbor list this is a scatter-fold over edges: each edge
+  // (i,j) contributes rho to both endpoints (Newton's third law).  Atom i's own
+  // density is the reduce (+) of rho_beta over its in-cutoff neighbors; the
+  // reciprocal contribution is scattered onto rho[j].  Ghost contributions are
+  // summed back by reverse communication below.
+  // -------------------------------------------------------------------------
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-    itype = type[i];
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
+  for (int ii = 0; ii < inum; ii++) {
+    const int i = ilist[ii];
+    const int itype = type[i];
+    const std::vector<NeighborContext> neighbors =
+        in_cutoff_neighbors(i, x, type, firstneigh[i], numneigh[i], cutforcesq, rdr, nr);
 
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
+    rho[i] = reduce(neighbors, rho[i], [&](double acc, const NeighborContext &nb) {
+      return acc + eam_density_value(rhor_spline, type2rhor, nb.jtype, itype, nb.radial);
+    });
 
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      if (rsq < cutforcesq) {
-        jtype = type[j];
-        p = sqrt(rsq)*rdr + 1.0;
-        m = static_cast<int>(p);
-        m = MIN(m,nr-1);
-        p -= m;
-        p = MIN(p,1.0);
-        coeff = rhor_spline[type2rhor[jtype][itype]][m];
-        rho[i] += ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-        if (newton_pair || j < nlocal) {
-          coeff = rhor_spline[type2rhor[itype][jtype]][m];
-          rho[j] += ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-        }
-      }
+    for (const NeighborContext &nb : neighbors) {
+      if (newton_pair || nb.j < nlocal)
+        rho[nb.j] += eam_density_value(rhor_spline, type2rhor, itype, nb.jtype, nb.radial);
     }
   }
 
@@ -224,27 +445,25 @@ void PairEAM::compute(int eflag, int vflag)
 
   if (newton_pair) comm->reverse_comm(this);
 
-  // fp = derivative of embedding energy at each atom
-  // phi = embedding energy at each atom
-  // if rho > rhomax (e.g. due to close approach of two atoms),
-  //   will exceed table, so add linear term to conserve energy
+  // -------------------------------------------------------------------------
+  // Stage 2 - embedding:  map over atoms of  fp_i = F'(rho_i),  E += F(rho_i)
+  //
+  // if rho > rhomax (e.g. due to close approach of two atoms) it exceeds the
+  // table, so add a linear term to conserve energy.
+  // -------------------------------------------------------------------------
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    p = rho[i]*rdrho + 1.0;
-    m = static_cast<int>(p);
-    m = MAX(1,MIN(m,nrho-1));
-    p -= m;
-    p = MIN(p,1.0);
-    coeff = frho_spline[type2frho[type[i]]][m];
-    fp[i] = (coeff[0]*p + coeff[1])*p + coeff[2];
+  for (int ii = 0; ii < inum; ii++) {
+    const int i = ilist[ii];
+    const int itype = type[i];
+    const SplinePoint density = eam_density_spline_point(rho[i], rdrho, nrho);
+    fp[i] = eam_embedding_derivative(frho_spline, type2frho, itype, density);
     if (eflag) {
-      phi = ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
+      double phi = eam_embedding_energy(frho_spline, type2frho, itype, density);
       if (rho[i] > rhomax) {
         phi += fp[i] * (rho[i]-rhomax);
         beyond_rhomax = 1;
       }
-      phi *= scale[type[i]][type[i]];
+      phi *= scale[itype][itype];
       if (eflag_global) eng_vdwl += phi;
       if (eflag_atom) eatom[i] += phi;
     }
@@ -255,76 +474,34 @@ void PairEAM::compute(int eflag, int vflag)
   comm->forward_comm(this);
   embedstep = update->ntimestep;
 
-  // compute forces on each atom
-  // loop over neighbors of my atoms
+  // -------------------------------------------------------------------------
+  // Stage 3 - forces + pair energy:  fold over half-list edges
+  //
+  // For each pair the scalar force is fpair = -(dE/dr)/r, where
+  //   dE/dr = F'(rho_i) rho'_(j->i) + F'(rho_j) rho'_(i->j) + phi'(r).
+  // The equal-and-opposite force is scattered onto atoms i and j, and the pair
+  // energy phi(r) is tallied through ev_tally (which supplies the 1/2 and the
+  // half-list double-count bookkeeping for the (1/2) sum phi term).
+  // -------------------------------------------------------------------------
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-    itype = type[i];
+  for (int ii = 0; ii < inum; ii++) {
+    const int i = ilist[ii];
+    const int itype = type[i];
+    const std::vector<NeighborContext> neighbors =
+        in_cutoff_neighbors(i, x, type, firstneigh[i], numneigh[i], cutforcesq, rdr, nr);
+    numforce[i] = static_cast<int>(neighbors.size());
 
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
-    numforce[i] = 0;
+    for (const NeighborContext &nb : neighbors) {
+      const EAMPairSplineTerms terms = eam_pair_spline_terms(
+          rhor_spline, z2r_spline, type2rhor, type2z2r, itype, nb.jtype, nb.radial);
+      const PairForceEnergy pe =
+          eam_pair_force_energy(terms, fp[i], fp[nb.j], nb.r, scale[itype][nb.jtype]);
 
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
+      apply_pair_force(f, i, nb.j, nb.rij, pe.fpair, newton_pair, nlocal);
 
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      if (rsq < cutforcesq) {
-        ++numforce[i];
-        jtype = type[j];
-        r = sqrt(rsq);
-        p = r*rdr + 1.0;
-        m = static_cast<int>(p);
-        m = MIN(m,nr-1);
-        p -= m;
-        p = MIN(p,1.0);
-
-        // rhoip = derivative of (density at atom j due to atom i)
-        // rhojp = derivative of (density at atom i due to atom j)
-        // phi = pair potential energy
-        // phip = phi'
-        // z2 = phi * r
-        // z2p = (phi * r)' = (phi' r) + phi
-        // psip needs both fp[i] and fp[j] terms since r_ij appears in two
-        //   terms of embed eng: Fi(sum rho_ij) and Fj(sum rho_ji)
-        //   hence embed' = Fi(sum rho_ij) rhojp + Fj(sum rho_ji) rhoip
-        // scale factor can be applied by thermodynamic integration
-
-        coeff = rhor_spline[type2rhor[itype][jtype]][m];
-        rhoip = (coeff[0]*p + coeff[1])*p + coeff[2];
-        coeff = rhor_spline[type2rhor[jtype][itype]][m];
-        rhojp = (coeff[0]*p + coeff[1])*p + coeff[2];
-        coeff = z2r_spline[type2z2r[itype][jtype]][m];
-        z2p = (coeff[0]*p + coeff[1])*p + coeff[2];
-        z2 = ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-
-        recip = 1.0/r;
-        phi = z2*recip;
-        phip = z2p*recip - phi*recip;
-        psip = fp[i]*rhojp + fp[j]*rhoip + phip;
-        fpair = -scale[itype][jtype]*psip*recip;
-
-        f[i][0] += delx*fpair;
-        f[i][1] += dely*fpair;
-        f[i][2] += delz*fpair;
-        if (newton_pair || j < nlocal) {
-          f[j][0] -= delx*fpair;
-          f[j][1] -= dely*fpair;
-          f[j][2] -= delz*fpair;
-        }
-
-        if (eflag) evdwl = scale[itype][jtype]*phi;
-        if (evflag) ev_tally(i,j,nlocal,newton_pair,evdwl,0.0,fpair,delx,dely,delz);
-      }
+      const double evdwl = eflag ? pe.pair_energy : 0.0;
+      if (evflag)
+        ev_tally(i, nb.j, nlocal, newton_pair, evdwl, 0.0, pe.fpair, nb.rij.x, nb.rij.y, nb.rij.z);
     }
   }
 
