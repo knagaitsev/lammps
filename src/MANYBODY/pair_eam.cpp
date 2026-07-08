@@ -25,6 +25,7 @@
 #include "memory.h"
 #include "neighbor.h"
 #include "neigh_list.h"
+#include "neigh_request.h"
 #include "potential_file_reader.h"
 #include "update.h"
 
@@ -258,17 +259,13 @@ std::vector<NeighborContext> in_cutoff_neighbors(int i, double **x, int *type, i
   });
 }
 
-void apply_pair_force(double **f, int i, int j, const Vec3 &rij, double fpair, int newton_pair,
-                      int nlocal)
+// full neighbor list: accumulate the pair force onto atom i only; the reciprocal
+// force on j is produced when atom j is visited with i as its neighbor
+void accumulate_pair_force(double **f, int i, const Vec3 &rij, double fpair)
 {
   f[i][0] += rij.x*fpair;
   f[i][1] += rij.y*fpair;
   f[i][2] += rij.z*fpair;
-  if (newton_pair || j < nlocal) {
-    f[j][0] -= rij.x*fpair;
-    f[j][1] -= rij.y*fpair;
-    f[j][2] -= rij.z*fpair;
-  }
 }
 
 }    // namespace
@@ -280,6 +277,11 @@ PairEAM::PairEAM(LAMMPS *lmp) : Pair(lmp)
   restartinfo = 0;
   manybody_flag = 1;
   atomic_energy_enable = 1;
+
+  // full neighbor list: each atom sees all its neighbors, so the virial is
+  // tallied per pair (via ev_tally_full) rather than through fdotr
+  no_virial_fdotr_compute = 1;
+
   embedstep = -1;
   unit_convert_flag = utils::get_supported_conversions(utils::ENERGY);
 
@@ -400,29 +402,24 @@ void PairEAM::compute(int eflag, int vflag)
   double **x = atom->x;
   double **f = atom->f;
   int *type = atom->type;
-  const int nlocal = atom->nlocal;
-  const int nall = nlocal + atom->nghost;
-  const int newton_pair = force->newton_pair;
 
   const int inum = list->inum;
   int *ilist = list->ilist;
   int *numneigh = list->numneigh;
   int **firstneigh = list->firstneigh;
 
-  // zero out density
-
-  if (newton_pair) {
-    for (int i = 0; i < nall; i++) rho[i] = 0.0;
-  } else for (int i = 0; i < nlocal; i++) rho[i] = 0.0;
-
   // -------------------------------------------------------------------------
-  // Stage 1 - density:  rho_i = sum_{j != i} rho_beta(r_ij)
+  // Stage 1+2 - density and embedding:  map over atoms
   //
-  // With a half neighbor list this is a scatter-fold over edges: each edge
-  // (i,j) contributes rho to both endpoints (Newton's third law).  Atom i's own
-  // density is the reduce (+) of rho_beta over its in-cutoff neighbors; the
-  // reciprocal contribution is scattered onto rho[j].  Ghost contributions are
-  // summed back by reverse communication below.
+  //     rho_i = sum_{j != i} rho_beta(r_ij)     (full list: reduce over all
+  //                                              of atom i's neighbors)
+  //     fp_i  = F'(rho_i),   E += F(rho_i)
+  //
+  // With a full neighbor list each atom's density is complete from its own
+  // neighbor loop, so density and embedding fuse into a single map over atoms
+  // (no Newton scatter, no reverse communication).  If rho > rhomax (close
+  // approach of two atoms) it exceeds the table, so a linear term conserves
+  // energy.
   // -------------------------------------------------------------------------
 
   for (int ii = 0; ii < inum; ii++) {
@@ -431,30 +428,10 @@ void PairEAM::compute(int eflag, int vflag)
     const std::vector<NeighborContext> neighbors =
         in_cutoff_neighbors(i, x, type, firstneigh[i], numneigh[i], cutforcesq, rdr, nr);
 
-    rho[i] = reduce(neighbors, rho[i], [&](double acc, const NeighborContext &nb) {
+    rho[i] = reduce(neighbors, 0.0, [&](double acc, const NeighborContext &nb) {
       return acc + eam_density_value(rhor_spline, type2rhor, nb.jtype, itype, nb.radial);
     });
 
-    for (const NeighborContext &nb : neighbors) {
-      if (newton_pair || nb.j < nlocal)
-        rho[nb.j] += eam_density_value(rhor_spline, type2rhor, itype, nb.jtype, nb.radial);
-    }
-  }
-
-  // communicate and sum densities
-
-  if (newton_pair) comm->reverse_comm(this);
-
-  // -------------------------------------------------------------------------
-  // Stage 2 - embedding:  map over atoms of  fp_i = F'(rho_i),  E += F(rho_i)
-  //
-  // if rho > rhomax (e.g. due to close approach of two atoms) it exceeds the
-  // table, so add a linear term to conserve energy.
-  // -------------------------------------------------------------------------
-
-  for (int ii = 0; ii < inum; ii++) {
-    const int i = ilist[ii];
-    const int itype = type[i];
     const SplinePoint density = eam_density_spline_point(rho[i], rdrho, nrho);
     fp[i] = eam_embedding_derivative(frho_spline, type2frho, itype, density);
     if (eflag) {
@@ -469,19 +446,22 @@ void PairEAM::compute(int eflag, int vflag)
     }
   }
 
-  // communicate derivative of embedding function
+  // communicate derivative of embedding function to ghost atoms
+  // (the force stage reads fp[j] for neighbor j, which may be a ghost)
 
   comm->forward_comm(this);
   embedstep = update->ntimestep;
 
   // -------------------------------------------------------------------------
-  // Stage 3 - forces + pair energy:  fold over half-list edges
+  // Stage 3 - forces + pair energy:  fold over each atom's neighbors
   //
   // For each pair the scalar force is fpair = -(dE/dr)/r, where
   //   dE/dr = F'(rho_i) rho'_(j->i) + F'(rho_j) rho'_(i->j) + phi'(r).
-  // The equal-and-opposite force is scattered onto atoms i and j, and the pair
-  // energy phi(r) is tallied through ev_tally (which supplies the 1/2 and the
-  // half-list double-count bookkeeping for the (1/2) sum phi term).
+  // With a full list the force is accumulated onto atom i only (the reciprocal
+  // force is produced when atom j is visited with i as its neighbor).
+  // ev_tally_full tallies half the pair energy phi(r) and half the per-pair
+  // virial; summed over the two visits of each pair this yields the full
+  // (1/2) sum phi energy and the full virial.
   // -------------------------------------------------------------------------
 
   for (int ii = 0; ii < inum; ii++) {
@@ -497,11 +477,11 @@ void PairEAM::compute(int eflag, int vflag)
       const PairForceEnergy pe =
           eam_pair_force_energy(terms, fp[i], fp[nb.j], nb.r, scale[itype][nb.jtype]);
 
-      apply_pair_force(f, i, nb.j, nb.rij, pe.fpair, newton_pair, nlocal);
+      accumulate_pair_force(f, i, nb.rij, pe.fpair);
 
       const double evdwl = eflag ? pe.pair_energy : 0.0;
       if (evflag)
-        ev_tally(i, nb.j, nlocal, newton_pair, evdwl, 0.0, pe.fpair, nb.rij.x, nb.rij.y, nb.rij.z);
+        ev_tally_full(i, evdwl, 0.0, pe.fpair, nb.rij.x, nb.rij.y, nb.rij.z);
     }
   }
 
@@ -514,8 +494,6 @@ void PairEAM::compute(int eflag, int vflag)
                        "a linear extrapolation to the energy was made");
     }
   }
-
-  if (vflag_fdotr) virial_fdotr_compute();
 }
 
 /*********************************************************************
@@ -679,7 +657,7 @@ void PairEAM::init_style()
   file2array();
   array2spline();
 
-  neighbor->add_request(this);
+  neighbor->add_request(this, NeighConst::REQ_FULL);
   embedstep = -1;
 
   exceeded_rhomax = 0;
