@@ -53,6 +53,10 @@ using namespace LAMMPS_NS;
 namespace {
 
 // --- generic, order-preserving combinators --------------------------------
+// (in namespace `fn` because Pair already has an `int *map` member that would
+// otherwise shadow `map` inside PairEAM member functions)
+
+namespace fn {
 
 template <class T, class F>
 auto map(const std::vector<T> &xs, F f) -> std::vector<decltype(f(xs[0]))>
@@ -80,6 +84,16 @@ A reduce(const std::vector<T> &xs, A init, F f)
   for (const T &x : xs) acc = f(acc, x);
   return acc;
 }
+
+// effectful sibling of map: apply f to each element in order (used to drive the
+// map over all_atoms, where each atom's result is written to the output arrays)
+template <class T, class F>
+void for_each(const std::vector<T> &xs, F f)
+{
+  for (const T &x : xs) f(x);
+}
+
+}    // namespace fn
 
 // --- value types ----------------------------------------------------------
 
@@ -118,6 +132,18 @@ struct PairForceEnergy {
   double pair_energy;
 };
 
+// one pair's contribution to atom i's force and virial: the displacement r_ij
+// and the scalar fpair (force / r), so the force vector is fpair * r_ij
+struct PairTerm {
+  Vec3 rij;
+  double fpair;
+};
+
+// symmetric per-pair virial 6-vector (xx, yy, zz, xy, xz, yz)
+struct Virial6 {
+  double v[6];
+};
+
 // --- pure geometry --------------------------------------------------------
 
 Vec3 atom_position(double **x, int i)
@@ -133,6 +159,16 @@ Vec3 displacement(const Vec3 &xi, const Vec3 &xj)
 double dot(const Vec3 &a, const Vec3 &b)
 {
   return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+Vec3 add(const Vec3 &a, const Vec3 &b)
+{
+  return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+Vec3 scaled(const Vec3 &a, double s)
+{
+  return {a.x*s, a.y*s, a.z*s};
 }
 
 int neighbor_atom(int packed_neighbor)
@@ -226,6 +262,32 @@ PairForceEnergy eam_pair_force_energy(const EAMPairSplineTerms &terms, double fp
   return {-scale*psip*recip, scale*phi};
 }
 
+// phi: pair-potential energy for one pair, phi(r) = z2(r)/r (LAMMPS tabulates
+// z2 = r*phi), scaled by the per-type-pair scale factor
+double eam_pair_energy(double ***z2r_spline, int **type2z2r, int itype, int jtype,
+                       const SplinePoint &radial, double r, double scale)
+{
+  const double z2 = eam_spline_value(z2r_spline[type2z2r[itype][jtype]][radial.index], radial.fraction);
+  return scale * z2 / r;
+}
+
+// --- virial reduction -----------------------------------------------------
+
+// one pair's contribution to the central-force virial, weighted by 1/2 (each
+// pair is visited twice with a full list, so the two halves sum to the full
+// contribution) - matches Pair::ev_tally_full
+Virial6 half_virial(const Vec3 &rij, double fpair)
+{
+  return {{0.5*rij.x*rij.x*fpair, 0.5*rij.y*rij.y*fpair, 0.5*rij.z*rij.z*fpair,
+           0.5*rij.x*rij.y*fpair, 0.5*rij.x*rij.z*fpair, 0.5*rij.y*rij.z*fpair}};
+}
+
+Virial6 add(const Virial6 &a, const Virial6 &b)
+{
+  return {{a.v[0]+b.v[0], a.v[1]+b.v[1], a.v[2]+b.v[2],
+           a.v[3]+b.v[3], a.v[4]+b.v[4], a.v[5]+b.v[5]}};
+}
+
 // --- neighbor selection: filter to within-cutoff, map to NeighborContext ---
 
 // filter(not_curr_atom / within cutoff) . map(distance) over atom i's half list
@@ -244,28 +306,19 @@ std::vector<NeighborContext> in_cutoff_neighbors(int i, double **x, int *type, i
   std::vector<int> slots(jnum);
   for (int jj = 0; jj < jnum; jj++) slots[jj] = jj;
 
-  const std::vector<RawNeighbor> raw = map(slots, [&](int jj) {
+  const std::vector<RawNeighbor> raw = fn::map(slots, [&](int jj) {
     const int j = neighbor_atom(jlist[jj]);
     const Vec3 rij = displacement(xi, atom_position(x,j));
     return RawNeighbor{j, type[j], rij, dot(rij,rij)};
   });
 
   const std::vector<RawNeighbor> within =
-      filter(raw, [&](const RawNeighbor &nb) { return nb.rsq < cutforcesq; });
+      fn::filter(raw, [&](const RawNeighbor &nb) { return nb.rsq < cutforcesq; });
 
-  return map(within, [&](const RawNeighbor &nb) {
+  return fn::map(within, [&](const RawNeighbor &nb) {
     const double r = sqrt(nb.rsq);
     return NeighborContext{nb.j, nb.jtype, nb.rij, r, eam_radial_spline_point(r, rdr, nr)};
   });
-}
-
-// full neighbor list: accumulate the pair force onto atom i only; the reciprocal
-// force on j is produced when atom j is visited with i as its neighbor
-void accumulate_pair_force(double **f, int i, const Vec3 &rij, double fpair)
-{
-  f[i][0] += rij.x*fpair;
-  f[i][1] += rij.y*fpair;
-  f[i][2] += rij.z*fpair;
 }
 
 }    // namespace
@@ -408,82 +461,116 @@ void PairEAM::compute(int eflag, int vflag)
   int *numneigh = list->numneigh;
   int **firstneigh = list->firstneigh;
 
+  // the target's `all_atoms`: the local atoms this rank owns
+  const std::vector<int> all_atoms(ilist, ilist + inum);
+
   // -------------------------------------------------------------------------
-  // Stage 1+2 - density and embedding:  map over atoms
+  // Pass 1 - density + embedding + pair energy:  map over all_atoms
   //
-  //     rho_i = sum_{j != i} rho_beta(r_ij)     (full list: reduce over all
-  //                                              of atom i's neighbors)
-  //     fp_i  = F'(rho_i),   E += F(rho_i)
+  //   E_i = F( reduce (+) (map rho neighbors) )
+  //         + (1/2) * reduce (+) (map phi neighbors)
   //
-  // With a full neighbor list each atom's density is complete from its own
-  // neighbor loop, so density and embedding fuse into a single map over atoms
-  // (no Newton scatter, no reverse communication).  If rho > rhomax (close
-  // approach of two atoms) it exceeds the table, so a linear term conserves
-  // energy.
+  // the literal EAM per-atom energy of the target functional form.  A full
+  // neighbor list makes each atom's density complete from its own neighbor set,
+  // so density, embedding, and pair energy form a single map over atoms (no
+  // Newton scatter, no reverse communication).  fp_i = F'(rho_i) is stored for
+  // the force pass.  If rho > rhomax (close approach of two atoms) it exceeds
+  // the table, so a linear term conserves energy.
   // -------------------------------------------------------------------------
 
-  for (int ii = 0; ii < inum; ii++) {
-    const int i = ilist[ii];
+  fn::for_each(all_atoms, [&](int i) {
     const int itype = type[i];
     const std::vector<NeighborContext> neighbors =
         in_cutoff_neighbors(i, x, type, firstneigh[i], numneigh[i], cutforcesq, rdr, nr);
 
-    rho[i] = reduce(neighbors, 0.0, [&](double acc, const NeighborContext &nb) {
+    // rho_i = reduce (+) (map rho (map distance (filter not_curr_atom neighbors)))
+    const double rho_i = fn::reduce(neighbors, 0.0, [&](double acc, const NeighborContext &nb) {
       return acc + eam_density_value(rhor_spline, type2rhor, nb.jtype, itype, nb.radial);
     });
+    rho[i] = rho_i;
 
-    const SplinePoint density = eam_density_spline_point(rho[i], rdrho, nrho);
+    const SplinePoint density = eam_density_spline_point(rho_i, rdrho, nrho);
     fp[i] = eam_embedding_derivative(frho_spline, type2frho, itype, density);
+
     if (eflag) {
-      double phi = eam_embedding_energy(frho_spline, type2frho, itype, density);
-      if (rho[i] > rhomax) {
-        phi += fp[i] * (rho[i]-rhomax);
+      // F( rho_i ), with the rho > rhomax linear extrapolation
+      double embed = eam_embedding_energy(frho_spline, type2frho, itype, density);
+      if (rho_i > rhomax) {
+        embed += fp[i] * (rho_i - rhomax);
         beyond_rhomax = 1;
       }
-      phi *= scale[itype][itype];
-      if (eflag_global) eng_vdwl += phi;
-      if (eflag_atom) eatom[i] += phi;
+      embed *= scale[itype][itype];
+
+      // (1/2) * reduce (+) (map phi (map distance (filter not_curr_atom neighbors)))
+      const double pair =
+          0.5 * fn::reduce(neighbors, 0.0, [&](double acc, const NeighborContext &nb) {
+            return acc + eam_pair_energy(z2r_spline, type2z2r, itype, nb.jtype, nb.radial, nb.r,
+                                         scale[itype][nb.jtype]);
+          });
+
+      const double e_i = embed + pair;
+      if (eflag_global) eng_vdwl += e_i;
+      if (eflag_atom) eatom[i] += e_i;
     }
-  }
+  });
 
   // communicate derivative of embedding function to ghost atoms
-  // (the force stage reads fp[j] for neighbor j, which may be a ghost)
+  // (the force pass reads fp[j] for neighbor j, which may be a ghost)
 
   comm->forward_comm(this);
   embedstep = update->ntimestep;
 
   // -------------------------------------------------------------------------
-  // Stage 3 - forces + pair energy:  fold over each atom's neighbors
+  // Pass 2 - forces + virial:  map over all_atoms
   //
-  // For each pair the scalar force is fpair = -(dE/dr)/r, where
-  //   dE/dr = F'(rho_i) rho'_(j->i) + F'(rho_j) rho'_(i->j) + phi'(r).
-  // With a full list the force is accumulated onto atom i only (the reciprocal
-  // force is produced when atom j is visited with i as its neighbor).
-  // ev_tally_full tallies half the pair energy phi(r) and half the per-pair
-  // virial; summed over the two visits of each pair this yields the full
-  // (1/2) sum phi energy and the full virial.
+  //   f_i    = reduce (+) (map pair_force neighbors)   (force on atom i only)
+  //   virial = reduce (+) (map half_virial neighbors)
+  //
+  // the force is the analytic gradient -dE/dx_i.  With a full list the force is
+  // accumulated onto atom i only (the reciprocal is produced when atom j is
+  // visited with i as its neighbor).  Energy was tallied in pass 1, so only the
+  // virial is tallied here - half per visit, matching Pair::ev_tally_full.
   // -------------------------------------------------------------------------
 
-  for (int ii = 0; ii < inum; ii++) {
-    const int i = ilist[ii];
+  fn::for_each(all_atoms, [&](int i) {
     const int itype = type[i];
     const std::vector<NeighborContext> neighbors =
         in_cutoff_neighbors(i, x, type, firstneigh[i], numneigh[i], cutforcesq, rdr, nr);
     numforce[i] = static_cast<int>(neighbors.size());
 
-    for (const NeighborContext &nb : neighbors) {
-      const EAMPairSplineTerms terms = eam_pair_spline_terms(
+    // map each neighbor to its force term {r_ij, fpair}
+    const std::vector<PairTerm> terms = fn::map(neighbors, [&](const NeighborContext &nb) {
+      const EAMPairSplineTerms spline = eam_pair_spline_terms(
           rhor_spline, z2r_spline, type2rhor, type2z2r, itype, nb.jtype, nb.radial);
       const PairForceEnergy pe =
-          eam_pair_force_energy(terms, fp[i], fp[nb.j], nb.r, scale[itype][nb.jtype]);
+          eam_pair_force_energy(spline, fp[i], fp[nb.j], nb.r, scale[itype][nb.jtype]);
+      return PairTerm{nb.rij, pe.fpair};
+    });
 
-      accumulate_pair_force(f, i, nb.rij, pe.fpair);
+    // f_i = reduce (+) (map (t -> fpair * r_ij) terms)
+    const Vec3 fi = fn::reduce(terms, Vec3{0.0, 0.0, 0.0}, [](const Vec3 &acc, const PairTerm &t) {
+      return add(acc, scaled(t.rij, t.fpair));
+    });
+    f[i][0] += fi.x;
+    f[i][1] += fi.y;
+    f[i][2] += fi.z;
 
-      const double evdwl = eflag ? pe.pair_energy : 0.0;
-      if (evflag)
-        ev_tally_full(i, evdwl, 0.0, pe.fpair, nb.rij.x, nb.rij.y, nb.rij.z);
+    if (evflag) {
+      const Virial6 vir =
+          fn::reduce(terms, Virial6{{0.0, 0.0, 0.0, 0.0, 0.0, 0.0}},
+                 [](const Virial6 &acc, const PairTerm &t) {
+                   return add(acc, half_virial(t.rij, t.fpair));
+                 });
+      if (vflag_global) {
+        virial[0] += vir.v[0]; virial[1] += vir.v[1]; virial[2] += vir.v[2];
+        virial[3] += vir.v[3]; virial[4] += vir.v[4]; virial[5] += vir.v[5];
+      }
+      if (vflag_atom) {
+        vatom[i][0] += vir.v[0]; vatom[i][1] += vir.v[1]; vatom[i][2] += vir.v[2];
+        vatom[i][3] += vir.v[3]; vatom[i][4] += vir.v[4]; vatom[i][5] += vir.v[5];
+      }
     }
-  }
+  });
 
   if (eflag && (!exceeded_rhomax)) {
     MPI_Allreduce(&beyond_rhomax, &exceeded_rhomax, 1, MPI_INT, MPI_SUM, world);
