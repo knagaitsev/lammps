@@ -313,3 +313,7 @@ versus tolerance `6e-12` (`3e-11` for `run_forces`). The baseline numbers before
 the same to within a few units in the last digit (e.g. `init_stress (newton on)` 9.672e-14 both
 before and after), confirming that the reassociation introduced by the gather form is not the
 dominant error term.
+
+**Undefined behaviour.** `pair_eam.cpp` compiles clean under `g++ -Wall -Wextra`. A separate
+`-fsanitize=address,undefined` build (`/tmp/lammps-eam-san`, `RelWithDebInfo`, MANYBODY, no MPI)
+runs `PairStyle.plain` to completion with no ASan or UBSan diagnostics.
