@@ -30,6 +30,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <utility>
+#include <vector>
 
 using namespace LAMMPS_NS;
 
@@ -136,20 +138,309 @@ PairEAM::~PairEAM()
   memory->destroy(z2r_spline);
 }
 
+/* ----------------------------------------------------------------------
+   Functional core of the EAM computation.
+
+   Everything in the anonymous namespace below is file-local infrastructure
+   for the "functional extraction" of PairEAM::compute: a tiny set of generic
+   combinators (map / reduce / filter), a bundle of the immutable spline
+   tables, and the pure physics functions that the core math is expressed in.
+
+   The physics is written exclusively as compositions of fmap / freduce /
+   ffilter over pure functions of (types, r).  Loops appear only inside the
+   generic combinators, never in the physics.
+------------------------------------------------------------------------- */
+
+namespace {
+
+// ---------------------------------------------------------------------
+// Generic combinators.  These are the ONLY place a loop is allowed.
+// ---------------------------------------------------------------------
+
+template <class F, class T>
+auto fmap(F f, const std::vector<T> &xs) -> std::vector<decltype(f(std::declval<const T &>()))>
+{
+  std::vector<decltype(f(std::declval<const T &>()))> out;
+  out.reserve(xs.size());
+  for (const T &x : xs) out.push_back(f(x));
+  return out;
+}
+
+template <class F, class A, class T>
+A freduce(F f, A init, const std::vector<T> &xs)
+{
+  A acc = init;
+  for (const T &x : xs) acc = f(acc, x);
+  return acc;
+}
+
+template <class P, class T>
+std::vector<T> ffilter(P p, const std::vector<T> &xs)
+{
+  std::vector<T> out;
+  out.reserve(xs.size());
+  for (const T &x : xs) if (p(x)) out.push_back(x);
+  return out;
+}
+
+// index generator: [0,n) -- the "atoms" domain the outer maps run over
+std::vector<int> findices(int n)
+{
+  std::vector<int> out;
+  out.reserve(n);
+  for (int i = 0; i < n; ++i) out.push_back(i);
+  return out;
+}
+
+// ---------------------------------------------------------------------
+// Values
+// ---------------------------------------------------------------------
+
+struct Vec3 {
+  double x, y, z;
+};
+
+Vec3 vzero()                            { return Vec3{0.0, 0.0, 0.0}; }
+Vec3 vadd(const Vec3 &a, const Vec3 &b) { return Vec3{a.x + b.x, a.y + b.y, a.z + b.z}; }
+Vec3 vsub(const Vec3 &a, const Vec3 &b) { return Vec3{a.x - b.x, a.y - b.y, a.z - b.z}; }
+Vec3 vscale(const Vec3 &a, double s)    { return Vec3{a.x * s, a.y * s, a.z * s}; }
+double vnorm2(const Vec3 &a)            { return a.x * a.x + a.y * a.y + a.z * a.z; }
+
+struct AtomView {
+  Vec3 x;
+  int type;
+};
+
+// one entry of the (half) neighbor list, i.e. one interacting pair
+struct PairRef {
+  int i, j;
+};
+
+// per-pair record, everything TEARDOWN needs to drive ev_tally()
+struct PairContrib {
+  int i, j;
+  double evdwl, fpair;
+  double delx, dely, delz;
+};
+
+// (F, F') of the embedding function, plus the rhomax-extrapolation flag
+struct Embed {
+  double energy, deriv;
+  int beyond_rhomax;
+};
+
+// ---------------------------------------------------------------------
+// The immutable table state of PairEAM, bundled so that the pure physics
+// functions are referentially transparent in their true inputs (types, r).
+// Filled once in SETUP; never written by the core.
+// ---------------------------------------------------------------------
+
+struct EamTables {
+  double rdr, rdrho, cutforcesq, rhomax;
+  int nr, nrho;
+  double ***rhor_spline, ***frho_spline, ***z2r_spline;
+  int **type2rhor, **type2z2r, *type2frho;
+  double **scale;
+};
+
+// ---------------------------------------------------------------------
+// Pure physics.  Each spline table IS the numerical representation of the
+// analytic rho / phi / F, so a pure wrapper around the table lookup is a
+// faithful rendering of the analytic function.
+// ---------------------------------------------------------------------
+
+struct SplineIndex {
+  int m;
+  double p;
+};
+
+// interval + local coordinate for the r-indexed tables (rhor, z2r)
+SplineIndex r_index(const EamTables &t, double r)
+{
+  double p = r * t.rdr + 1.0;
+  int m = static_cast<int>(p);
+  m = MIN(m, t.nr - 1);
+  p -= m;
+  p = MIN(p, 1.0);
+  return SplineIndex{m, p};
+}
+
+// interval + local coordinate for the rho-indexed table (frho)
+SplineIndex rho_index(const EamTables &t, double rho)
+{
+  double p = rho * t.rdrho + 1.0;
+  int m = static_cast<int>(p);
+  m = MAX(1, MIN(m, t.nrho - 1));
+  p -= m;
+  p = MIN(p, 1.0);
+  return SplineIndex{m, p};
+}
+
+double spline_value(const double *c, double p) { return ((c[3] * p + c[4]) * p + c[5]) * p + c[6]; }
+double spline_deriv(const double *c, double p) { return (c[0] * p + c[1]) * p + c[2]; }
+
+// rho_b(r): density contributed at an atom of type dst by an atom of type src
+double rho_of_r(const EamTables &t, int src_type, int dst_type, double r)
+{
+  const SplineIndex s = r_index(t, r);
+  return spline_value(t.rhor_spline[t.type2rhor[src_type][dst_type]][s.m], s.p);
+}
+
+// rho_b'(r)
+double drho_of_r(const EamTables &t, int src_type, int dst_type, double r)
+{
+  const SplineIndex s = r_index(t, r);
+  return spline_deriv(t.rhor_spline[t.type2rhor[src_type][dst_type]][s.m], s.p);
+}
+
+// z2(r) = r*phi(r), the quantity the tables actually store
+double z2_of_r(const EamTables &t, int itype, int jtype, double r)
+{
+  const SplineIndex s = r_index(t, r);
+  return spline_value(t.z2r_spline[t.type2z2r[itype][jtype]][s.m], s.p);
+}
+
+double dz2_of_r(const EamTables &t, int itype, int jtype, double r)
+{
+  const SplineIndex s = r_index(t, r);
+  return spline_deriv(t.z2r_spline[t.type2z2r[itype][jtype]][s.m], s.p);
+}
+
+// phi_ab(r) = z2(r)/r, unscaled
+double phi_of_r(const EamTables &t, int itype, int jtype, double r)
+{
+  return z2_of_r(t, itype, jtype, r) * (1.0 / r);
+}
+
+// phi_ab'(r) = (z2'(r) - z2(r)/r)/r, unscaled
+double dphi_of_r(const EamTables &t, int itype, int jtype, double r)
+{
+  const double recip = 1.0 / r;
+  return dz2_of_r(t, itype, jtype, r) * recip - phi_of_r(t, itype, jtype, r) * recip;
+}
+
+// pair energy actually tallied by LAMMPS: scale_ab * phi_ab(r)
+double pair_energy(const EamTables &t, int itype, int jtype, double r)
+{
+  return t.scale[itype][jtype] * phi_of_r(t, itype, jtype, r);
+}
+
+// (F(rho), F'(rho)) with the linear extrapolation beyond rhomax folded in.
+// F is returned already multiplied by the diagonal scale factor, matching
+// the point at which the original applies it.
+Embed F_embed(const EamTables &t, int itype, double rho_bar)
+{
+  const SplineIndex s = rho_index(t, rho_bar);
+  const double *c = t.frho_spline[t.type2frho[itype]][s.m];
+  const double deriv = spline_deriv(c, s.p);
+  const double raw = spline_value(c, s.p);
+  const bool beyond = (rho_bar > t.rhomax);
+  const double extrapolated = beyond ? raw + deriv * (rho_bar - t.rhomax) : raw;
+  return Embed{extrapolated * t.scale[itype][itype], deriv, beyond ? 1 : 0};
+}
+
+// scalar pair force factor: fpair = -scale_ab * psip / r with
+// psip = F'(rho_bar_i) rho_b'(r) + F'(rho_bar_j) rho_a'(r) + phi_ab'(r)
+double pair_fpair(const EamTables &t, int itype, int jtype, double r, double fp_i, double fp_j)
+{
+  const double rhoip = drho_of_r(t, itype, jtype, r);    // d(rho at j due to i)
+  const double rhojp = drho_of_r(t, jtype, itype, r);    // d(rho at i due to j)
+  const double phip = dphi_of_r(t, itype, jtype, r);
+  const double psip = fp_i * rhojp + fp_j * rhoip + phip;
+  return -t.scale[itype][jtype] * psip * (1.0 / r);
+}
+
+// ---------------------------------------------------------------------
+// Core math -- stage 1a: rho_bar_i = sum_{j in N(i)} rho_{type_j}(r_ij)
+// ---------------------------------------------------------------------
+
+std::vector<double> eam_core_density(const EamTables &t, const std::vector<AtomView> &atoms,
+                                     const std::vector<std::vector<int>> &neighbors)
+{
+  return fmap(
+      [&](int i) {
+        const AtomView &ai = atoms[i];
+        return freduce(
+            [&](double acc, int j) {
+              return acc + rho_of_r(t, atoms[j].type, ai.type, std::sqrt(vnorm2(vsub(ai.x, atoms[j].x))));
+            },
+            0.0,
+            ffilter([&](int j) { return vnorm2(vsub(ai.x, atoms[j].x)) < t.cutforcesq; }, neighbors[i]));
+      },
+      findices(static_cast<int>(atoms.size())));
+}
+
+// ---------------------------------------------------------------------
+// Core math -- stage 1b: per-atom embedding energy and its derivative
+// ---------------------------------------------------------------------
+
+std::vector<Embed> eam_core_embedding(const EamTables &t, const std::vector<AtomView> &atoms,
+                                      const std::vector<double> &rho_bar,
+                                      const std::vector<int> &owned)
+{
+  return fmap([&](int i) { return F_embed(t, atoms[i].type, rho_bar[i]); }, owned);
+}
+
+// ---------------------------------------------------------------------
+// Core math -- stage 2: forces (needs fp of the *neighbours*, hence a
+// second stage) and the per-pair energy/virial contributions.
+// ---------------------------------------------------------------------
+
+struct EamStage2 {
+  std::vector<Vec3> force;
+  std::vector<PairContrib> pair_contribs;
+};
+
+// force contribution on i from a single neighbour j
+Vec3 pair_force_vec(const EamTables &t, const std::vector<AtomView> &atoms,
+                    const std::vector<double> &fp, int i, int j)
+{
+  const Vec3 del = vsub(atoms[i].x, atoms[j].x);
+  const double r = std::sqrt(vnorm2(del));
+  return vscale(del, pair_fpair(t, atoms[i].type, atoms[j].type, r, fp[i], fp[j]));
+}
+
+PairContrib pair_contrib(const EamTables &t, const std::vector<AtomView> &atoms,
+                         const std::vector<double> &fp, const PairRef &pr)
+{
+  const Vec3 del = vsub(atoms[pr.i].x, atoms[pr.j].x);
+  const double r = std::sqrt(vnorm2(del));
+  const int itype = atoms[pr.i].type;
+  const int jtype = atoms[pr.j].type;
+  return PairContrib{pr.i, pr.j, pair_energy(t, itype, jtype, r),
+                     pair_fpair(t, itype, jtype, r, fp[pr.i], fp[pr.j]), del.x, del.y, del.z};
+}
+
+EamStage2 eam_core_forces(const EamTables &t, const std::vector<AtomView> &atoms,
+                          const std::vector<std::vector<int>> &neighbors,
+                          const std::vector<PairRef> &half_pairs, const std::vector<double> &fp)
+{
+  std::vector<Vec3> force = fmap(
+      [&](int i) {
+        return freduce(
+            vadd, vzero(),
+            fmap([&](int j) { return pair_force_vec(t, atoms, fp, i, j); },
+                 ffilter([&](int j) { return vnorm2(vsub(atoms[i].x, atoms[j].x)) < t.cutforcesq; },
+                         neighbors[i])));
+      },
+      findices(static_cast<int>(atoms.size())));
+
+  std::vector<PairContrib> contribs =
+      fmap([&](const PairRef &pr) { return pair_contrib(t, atoms, fp, pr); },
+           ffilter([&](const PairRef &pr) {
+             return vnorm2(vsub(atoms[pr.i].x, atoms[pr.j].x)) < t.cutforcesq;
+           }, half_pairs));
+
+  return EamStage2{std::move(force), std::move(contribs)};
+}
+
+}    // namespace
+
 /* ---------------------------------------------------------------------- */
 
 void PairEAM::compute(int eflag, int vflag)
 {
-  int i,j,ii,jj,m,inum,jnum,itype,jtype;
-  double xtmp,ytmp,ztmp,delx,dely,delz,evdwl,fpair;
-  double rsq,r,p,rhoip,rhojp,z2,z2p,recip,phip,psip,phi;
-  double *coeff;
-  int *ilist,*jlist,*numneigh,**firstneigh;
-
-  evdwl = 0.0;
   ev_init(eflag,vflag);
-
-  int beyond_rhomax = 0;
 
   // grow energy and fp arrays if necessary
   // need to be atom->nmax in length
@@ -164,169 +455,116 @@ void PairEAM::compute(int eflag, int vflag)
     memory->create(numforce,nmax,"pair:numforce");
   }
 
+  // ------------------------------------------------------------------
+  // SETUP: marshal LAMMPS data structures into plain values
+  // ------------------------------------------------------------------
+
   double **x = atom->x;
   double **f = atom->f;
   int *type = atom->type;
-  int nlocal = atom->nlocal;
-  int nall = nlocal + atom->nghost;
-  int newton_pair = force->newton_pair;
+  const int nlocal = atom->nlocal;
+  const int nall = nlocal + atom->nghost;
+  const int newton_pair = force->newton_pair;
 
-  inum = list->inum;
-  ilist = list->ilist;
-  numneigh = list->numneigh;
-  firstneigh = list->firstneigh;
+  const int inum = list->inum;
+  const int *const ilist = list->ilist;
+  const int *const numneigh = list->numneigh;
+  int **firstneigh = list->firstneigh;
 
-  // zero out density
+  const EamTables tables = {rdr, rdrho, cutforcesq, rhomax, nr, nrho,
+                            rhor_spline, frho_spline, z2r_spline,
+                            type2rhor, type2z2r, type2frho, scale};
 
-  if (newton_pair) {
-    for (i = 0; i < nall; i++) rho[i] = 0.0;
-  } else for (i = 0; i < nlocal; i++) rho[i] = 0.0;
+  std::vector<AtomView> atoms(nall);
+  for (int i = 0; i < nall; i++)
+    atoms[i] = AtomView{Vec3{x[i][0], x[i][1], x[i][2]}, type[i]};
 
-  // rho = density at each atom
-  // loop over neighbors of my atoms
+  // the half neighbor list, flattened into plain (i,j) pairs, in the exact
+  // order the original loops visited them (so ev_tally sees the same order)
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-    itype = type[i];
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
-
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
-
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      if (rsq < cutforcesq) {
-        jtype = type[j];
-        p = sqrt(rsq)*rdr + 1.0;
-        m = static_cast<int>(p);
-        m = MIN(m,nr-1);
-        p -= m;
-        p = MIN(p,1.0);
-        coeff = rhor_spline[type2rhor[jtype][itype]][m];
-        rho[i] += ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-        if (newton_pair || j < nlocal) {
-          coeff = rhor_spline[type2rhor[itype][jtype]][m];
-          rho[j] += ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-        }
-      }
-    }
+  std::vector<PairRef> half_pairs;
+  for (int ii = 0; ii < inum; ii++) {
+    const int i = ilist[ii];
+    const int *jlist = firstneigh[i];
+    for (int jj = 0; jj < numneigh[i]; jj++)
+      half_pairs.push_back(PairRef{i, jlist[jj] & NEIGHMASK});
   }
 
-  // communicate and sum densities
+  // symmetrized per-atom neighbor sets: (i,j) puts j into N(i), and i into
+  // N(j) exactly when the original applied the reverse contribution
+  // (newton_pair || j < nlocal).  Cutoff filtering happens in the core.
 
+  std::vector<std::vector<int>> neighbors(nall);
+  for (const PairRef &pr : half_pairs) {
+    neighbors[pr.i].push_back(pr.j);
+    if (newton_pair || pr.j < nlocal) neighbors[pr.j].push_back(pr.i);
+  }
+
+  std::vector<int> owned(ilist, ilist + inum);
+
+  // ------------------------------------------------------------------
+  // CORE stage 1a: densities
+  // ------------------------------------------------------------------
+
+  const std::vector<double> rho_bar = eam_core_density(tables, atoms, neighbors);
+
+  // GLUE: scatter densities back and let MPI sum the ghost contributions
+
+  for (int i = 0; i < nall; i++) rho[i] = rho_bar[i];
   if (newton_pair) comm->reverse_comm(this);
 
-  // fp = derivative of embedding energy at each atom
-  // phi = embedding energy at each atom
-  // if rho > rhomax (e.g. due to close approach of two atoms),
-  //   will exceed table, so add linear term to conserve energy
+  // ------------------------------------------------------------------
+  // CORE stage 1b: embedding energy and its derivative per owned atom
+  // ------------------------------------------------------------------
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    p = rho[i]*rdrho + 1.0;
-    m = static_cast<int>(p);
-    m = MAX(1,MIN(m,nrho-1));
-    p -= m;
-    p = MIN(p,1.0);
-    coeff = frho_spline[type2frho[type[i]]][m];
-    fp[i] = (coeff[0]*p + coeff[1])*p + coeff[2];
+  std::vector<double> rho_summed(nall);
+  for (int i = 0; i < nall; i++) rho_summed[i] = rho[i];
+
+  const std::vector<Embed> embed = eam_core_embedding(tables, atoms, rho_summed, owned);
+
+  // TEARDOWN (embedding part): fp array, energy accumulators
+
+  int beyond_rhomax = 0;
+  for (int ii = 0; ii < inum; ii++) {
+    const int i = owned[ii];
+    fp[i] = embed[ii].deriv;
     if (eflag) {
-      phi = ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-      if (rho[i] > rhomax) {
-        phi += fp[i] * (rho[i]-rhomax);
-        beyond_rhomax = 1;
-      }
-      phi *= scale[type[i]][type[i]];
-      if (eflag_global) eng_vdwl += phi;
-      if (eflag_atom) eatom[i] += phi;
+      if (embed[ii].beyond_rhomax) beyond_rhomax = 1;
+      if (eflag_global) eng_vdwl += embed[ii].energy;
+      if (eflag_atom) eatom[i] += embed[ii].energy;
     }
   }
 
-  // communicate derivative of embedding function
+  // GLUE: distribute the embedding derivative to the ghosts
 
   comm->forward_comm(this);
   embedstep = update->ntimestep;
 
-  // compute forces on each atom
-  // loop over neighbors of my atoms
+  std::vector<double> fp_all(fp, fp + nall);
 
-  for (ii = 0; ii < inum; ii++) {
-    i = ilist[ii];
-    xtmp = x[i][0];
-    ytmp = x[i][1];
-    ztmp = x[i][2];
-    itype = type[i];
+  // ------------------------------------------------------------------
+  // CORE stage 2: forces and per-pair energy/virial contributions
+  // ------------------------------------------------------------------
 
-    jlist = firstneigh[i];
-    jnum = numneigh[i];
-    numforce[i] = 0;
+  const EamStage2 stage2 = eam_core_forces(tables, atoms, neighbors, half_pairs, fp_all);
 
-    for (jj = 0; jj < jnum; jj++) {
-      j = jlist[jj];
-      j &= NEIGHMASK;
+  // ------------------------------------------------------------------
+  // TEARDOWN: scatter results into the LAMMPS accumulators
+  // ------------------------------------------------------------------
 
-      delx = xtmp - x[j][0];
-      dely = ytmp - x[j][1];
-      delz = ztmp - x[j][2];
-      rsq = delx*delx + dely*dely + delz*delz;
-
-      if (rsq < cutforcesq) {
-        ++numforce[i];
-        jtype = type[j];
-        r = sqrt(rsq);
-        p = r*rdr + 1.0;
-        m = static_cast<int>(p);
-        m = MIN(m,nr-1);
-        p -= m;
-        p = MIN(p,1.0);
-
-        // rhoip = derivative of (density at atom j due to atom i)
-        // rhojp = derivative of (density at atom i due to atom j)
-        // phi = pair potential energy
-        // phip = phi'
-        // z2 = phi * r
-        // z2p = (phi * r)' = (phi' r) + phi
-        // psip needs both fp[i] and fp[j] terms since r_ij appears in two
-        //   terms of embed eng: Fi(sum rho_ij) and Fj(sum rho_ji)
-        //   hence embed' = Fi(sum rho_ij) rhojp + Fj(sum rho_ji) rhoip
-        // scale factor can be applied by thermodynamic integration
-
-        coeff = rhor_spline[type2rhor[itype][jtype]][m];
-        rhoip = (coeff[0]*p + coeff[1])*p + coeff[2];
-        coeff = rhor_spline[type2rhor[jtype][itype]][m];
-        rhojp = (coeff[0]*p + coeff[1])*p + coeff[2];
-        coeff = z2r_spline[type2z2r[itype][jtype]][m];
-        z2p = (coeff[0]*p + coeff[1])*p + coeff[2];
-        z2 = ((coeff[3]*p + coeff[4])*p + coeff[5])*p + coeff[6];
-
-        recip = 1.0/r;
-        phi = z2*recip;
-        phip = z2p*recip - phi*recip;
-        psip = fp[i]*rhojp + fp[j]*rhoip + phip;
-        fpair = -scale[itype][jtype]*psip*recip;
-
-        f[i][0] += delx*fpair;
-        f[i][1] += dely*fpair;
-        f[i][2] += delz*fpair;
-        if (newton_pair || j < nlocal) {
-          f[j][0] -= delx*fpair;
-          f[j][1] -= dely*fpair;
-          f[j][2] -= delz*fpair;
-        }
-
-        if (eflag) evdwl = scale[itype][jtype]*phi;
-        if (evflag) ev_tally(i,j,nlocal,newton_pair,evdwl,0.0,fpair,delx,dely,delz);
-      }
-    }
+  for (int i = 0; i < nall; i++) {
+    f[i][0] += stage2.force[i].x;
+    f[i][1] += stage2.force[i].y;
+    f[i][2] += stage2.force[i].z;
   }
+
+  for (int ii = 0; ii < inum; ii++) numforce[owned[ii]] = 0;
+  for (const PairContrib &c : stage2.pair_contribs) ++numforce[c.i];
+
+  if (evflag)
+    for (const PairContrib &c : stage2.pair_contribs)
+      ev_tally(c.i, c.j, nlocal, newton_pair, eflag ? c.evdwl : 0.0, 0.0, c.fpair, c.delx, c.dely,
+               c.delz);
 
   if (eflag && (!exceeded_rhomax)) {
     MPI_Allreduce(&beyond_rhomax, &exceeded_rhomax, 1, MPI_INT, MPI_SUM, world);
